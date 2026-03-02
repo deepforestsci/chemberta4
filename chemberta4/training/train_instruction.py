@@ -1,0 +1,175 @@
+import gc
+from datetime import datetime
+from types import SimpleNamespace
+
+import pytorch_lightning as pl
+import torch
+from datasets import load_dataset
+from peft import PeftModel
+from pytorch_lightning.callbacks import LearningRateMonitor
+from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from chemberta4.callbacks import WandbCallback
+from chemberta4.data import InstructionDataset
+from chemberta4.trainer import OLMoPretrainer
+from chemberta4.utils import is_main_process, log0
+
+
+def run_instruction_experiment(args: SimpleNamespace, task_name: str) -> None:
+    """Run instruction tuning on an instruction dataset.
+
+    Parameters
+    ----------
+    args : SimpleNamespace
+        Training arguments (model, data, optimizer, and logging settings).
+    task_name : str
+        Name of the instruction-tuning dataset (e.g. 'uspto').
+    """
+    log0(f"Loading dataset: {args.dataset}")
+
+    # Load dataset (streaming)
+    dataset = (
+        load_dataset(args.dataset, split="train", streaming=True, trust_remote_code=True)
+        .take(args.num_samples)
+    )
+
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Split into train/val
+    all_data = list(dataset)
+    val_size = int(len(all_data) * args.val_ratio)
+    val_data = all_data[:val_size]
+    train_data = all_data[val_size:]
+
+    train_dataset = InstructionDataset(train_data, tokenizer, args.max_len)
+    val_dataset = InstructionDataset(val_data, tokenizer, args.max_len)
+    log0(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
+
+    # DataLoaders
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": 4,
+        "pin_memory": True,
+    }
+    train_dataloader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_dataloader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+
+    # Model
+    model = OLMoPretrainer(
+        model_name=args.model_name,
+        finetune_strategy=args.finetune_strategy,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        warmup_ratio=args.warmup_ratio,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+    )
+
+    # Callbacks
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    callbacks = [
+        LearningRateMonitor(logging_interval="step"),
+        *([ WandbCallback() ] if args.wandb else []),
+    ]
+
+    num_devices = torch.cuda.device_count() or 1
+
+    # Tracker init (rank 0 only)
+    if is_main_process() and args.wandb:
+        import wandb
+
+        if args.wandb_key:
+            wandb.login(key=args.wandb_key)
+
+        project_name = args.wandb_project or f"chemberta4-instruction-{task_name}"
+        log_params = {k: v for k, v in vars(args).items() if k != "wandb_key"}
+        wandb.init(
+            entity=args.wandb_entity,
+            project=project_name,
+            name=f"instruction-{task_name}_{timestamp}",
+            config=log_params,
+            reinit=True,
+        )
+        wandb.config.update({
+            "dataset": args.dataset,
+            "num_samples": args.num_samples,
+            "num_devices": num_devices,
+            "effective_batch_size": args.batch_size * args.gradient_accum * num_devices,
+        })
+
+    # Trainer
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=-1,
+        strategy="ddp",
+        precision="16-mixed",
+        max_epochs=args.epochs,
+        accumulate_grad_batches=args.gradient_accum,
+        gradient_clip_val=args.max_grad_norm,
+        callbacks=callbacks,
+        log_every_n_steps=10,
+        enable_checkpointing=False,
+        enable_progress_bar=True,
+        val_check_interval=args.val_check_interval,
+    )
+
+    # Train
+    log0("Starting instruction tuning...")
+    trainer.fit(model, train_dataloader, val_dataloader)
+
+    # Finalize tracker
+    if is_main_process() and args.wandb:
+        import wandb
+
+        for key, value in trainer.callback_metrics.items():
+            wandb.log({f"final_{key.replace('/', '_')}": float(value)})
+        wandb.finish()
+
+    # Merge and push to hub
+    if trainer.is_global_zero and args.hub_name:
+        log0("Training complete. Saving adapter...")
+
+        adapter_path = f"{args.output_dir}/{task_name}_instruction_adapter"
+        model.model.save_pretrained(adapter_path)
+        tokenizer.save_pretrained(adapter_path)
+
+        log0("Freeing VRAM for merge...")
+        del model
+        del trainer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        log0("Loading base model in FP16 for merging...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            return_dict=True,
+            torch_dtype=torch.float16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+
+        log0("Loading adapter and merging...")
+        model_to_merge = PeftModel.from_pretrained(base_model, adapter_path)
+        model_to_merge = model_to_merge.merge_and_unload()
+
+        log0(f"Pushing merged model to Hub: {args.hub_name}")
+        model_to_merge.push_to_hub(args.hub_name)
+        tokenizer.push_to_hub(args.hub_name)
+
+        log0(f"Done! Model available at: https://huggingface.co/{args.hub_name}")
+    elif trainer.is_global_zero:
+        adapter_path = f"{args.output_dir}/{task_name}_instruction_adapter"
+        model.model.save_pretrained(adapter_path)
+        tokenizer.save_pretrained(adapter_path)
+        log0(f"Adapter saved to: {adapter_path}")
+
+    # Cleanup
+    del model, trainer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
